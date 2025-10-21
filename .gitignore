@@ -2,10 +2,11 @@
 __pycache__/
 *.py[codz]
 *$py.class
-
+*.sol
 # C extensions
 *.so
-
+*.zip
+*.txt
 # Distribution / packaging
 .Python
 build/
@@ -205,3 +206,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Project specific ignores
+dataset_preprocessing_for_vulnerabilities/
+__MACOSX/
+Ethereum_smart_contract_datast/
