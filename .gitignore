@@ -1,6 +1,9 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 runs/
+models/
+models_fast/
+*.sh
 *.py[codz]
 *$py.class
 *.sol
