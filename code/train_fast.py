@@ -318,11 +318,9 @@ def main():
     # Training order: reentrancy -> timestamp -> integeroverflow
     vulnerability_types = ['reentrancy', 'timestamp', 'integeroverflow']
     
-    # Model configurations to test
+    # Model configurations to test (QGCN Linear only)
     model_configs = [
         {'name': 'QGCN_Linear', 'classifier': None},
-        {'name': 'QGCN_MPS', 'classifier': 'MPS'},
-        {'name': 'QGCN_TTN', 'classifier': 'TTN'},
     ]
     
     results = []

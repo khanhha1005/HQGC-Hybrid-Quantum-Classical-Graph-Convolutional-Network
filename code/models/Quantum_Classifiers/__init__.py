@@ -1,9 +1,1 @@
-from .MPS import MPS
-from .TTN import TTN
-
-__all__ = ['MPS', 'TTN']
-
-
-
-
-
+# QGCN uses Linear classifier only; MPS/TTN removed

@@ -1,62 +1,31 @@
+"""
+Quantum Neural Network circuit for node embedding.
+Uses PennyLane with AngleEmbedding and variational layers.
+"""
+
+import torch
 import pennylane as qml
 
 
-def H_layer(nqubits):
-    """Layer of single-qubit Hadamard gates.
+def quantum_net(n_qubits, n_layers):
     """
-    for idx in range(nqubits):
-        qml.Hadamard(wires=idx)
-
-
-def encoder(w):
-    """Layer of parametrized qubit rotations around the x axis.
+    Create a quantum neural network module for node embedding.
+    
+    Args:
+        n_qubits: Number of qubits
+        n_layers: Number of variational layers
+    
+    Returns:
+        torch.nn.Module that maps [N, n_qubits] -> [N, n_qubits]
     """
-    for idx, element in enumerate(w):
-        qml.RY(element, wires=idx)
-
-
-def Rot_layer(gate, w):
-    """Layer of parametrized qubit rotations around the y axis.
-    """
-    for idx, element in enumerate(w):
-        gate(element, wires=idx)
-
-
-def entangling_layer(nqubits):
-    """Layers of CZ and RY gates.
-    """
-    for i in range(0, nqubits - 1):  # Loop over even indices: i=0,2,...N-2
-        qml.CNOT(wires=[i, i + 1])
-
-    qml.CNOT(wires=[nqubits-1, 0])
-
-
-def quantum_net(n_qubits, q_depth):
-
     dev = qml.device("default.qubit", wires=n_qubits)
 
-    @qml.qnode(dev, interface='torch')
-    def quantum_circuit(inputs, q_weights_flat):
-        """
-        The variational quantum circuit.
-        """
+    @qml.qnode(dev, interface="torch")
+    def qnode(inputs, weights):
+        qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
+        qml.templates.BasicEntanglerLayers(weights, wires=range(n_qubits))
+        return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
 
-        # Reshape weights
-        q_weights = q_weights_flat.reshape(q_depth, 2, n_qubits)
-
-        # Embed features in the quantum node
-        qml.AngleEmbedding(inputs, wires=range(
-            n_qubits), rotation="Y")
-
-        # Sequence of trainable variational layers
-        for k in range(q_depth):
-            Rot_layer(qml.RY, q_weights[k][0])
-            entangling_layer(n_qubits)
-            Rot_layer(qml.RZ, q_weights[k][1])
-
-        # Expectation values in the Z basis
-        exp_vals = [qml.expval(qml.PauliZ(i))
-                    for i in range(n_qubits)]
-        return exp_vals
-
-    return qml.qnn.TorchLayer(quantum_circuit, {"q_weights_flat": (2*q_depth*n_qubits)})
+    weight_shapes = {"weights": (n_layers, n_qubits)}
+    qlayer = qml.qnn.TorchLayer(qnode, weight_shapes)
+    return qlayer
