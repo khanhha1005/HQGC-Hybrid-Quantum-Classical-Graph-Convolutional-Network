@@ -2,8 +2,8 @@
 __pycache__/
 runs/
 models/
-models/
 models_fast/
+figures/
 *.sh
 *.py[codz]
 *$py.class
