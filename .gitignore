@@ -2,6 +2,7 @@
 __pycache__/
 runs/
 models/
+models/
 models_fast/
 *.sh
 *.py[codz]
