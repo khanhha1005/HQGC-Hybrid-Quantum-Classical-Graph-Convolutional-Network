@@ -1,0 +1,23 @@
+{
+  "clamp_gradient_norm": 0.9,
+  "graph_rnn_activation": "relu",
+  "graph_rnn_cell": "gru",
+  "graph_state_dropout_keep_prob": 0.9,
+  "hidden_size": 256,
+  "learning_rate": 0.002,
+  "num_epochs": 250,
+  "num_nodes": 100000,
+  "out_layer_dropout_keep_prob": 0.9,
+  "patience": 200,
+  "propagation_rounds": 2,
+  "propagation_substeps": 20,
+  "task_ids": [
+    0
+  ],
+  "task_sample_ratios": {},
+  "tie_fwd_bkwd": false,
+  "train_file": "train_data/reentrancy/train.json",
+  "use_edge_bias": false,
+  "use_graph": true,
+  "valid_file": "train_data/reentrancy/valid.json"
+}
