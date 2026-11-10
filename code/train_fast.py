@@ -1,20 +1,34 @@
 """
-Fast training script for quantum GNN models on vulnerability detection datasets.
-Optimized for speed with 100 epochs.
+Train and evaluate HQGC (and its ablation variants) on the TMP smart-contract benchmark.
+
+Protocol (Sec. III-D of the paper):
+  - original released partition: train.json for training, valid.json as the test split;
+  - a stratified 10% of train.json is held out for early stopping; the test split is used once at the end;
+  - BCE, Adam (lr 1e-3), batch size 64, at most 100 epochs;
+  - validation F1 checked every 5 epochs, early stopping after 10 checks without improvement,
+    best checkpoint restored;
+  - five seeds (0-4), mean +- standard deviation reported.
+
+Example:
+  python code/train_fast.py --data_dir /path/to/GNNSCVulDetector/train_data
+  python code/train_fast.py --data_dir ... --variant classical          # VQC -> matched classical map
+  python code/train_fast.py --data_dir ... --vuln reentrancy --seeds 0 --latency
 """
 
-import os
-import sys
+import argparse
 import json
+import os
+import random
+import sys
+import time
+
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch_geometric.loader import DataLoader
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-import numpy as np
-from torch.utils.tensorboard import SummaryWriter
-from datetime import datetime
+from torch.nn import LeakyReLU
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
 # Add code directory to path
 code_dir = os.path.dirname(os.path.abspath(__file__))
@@ -23,474 +37,207 @@ if code_dir not in sys.path:
 
 from data.load_vulnerability_data import get_dataloaders
 from models.Quantum_GCN import QGCN
-from torch.nn import LeakyReLU
+from models.QNN_Node_Embedding import TimedQuantumNet, CIRCUIT_TIME
+
+# Variants of Table I: one component changed at a time
+VARIANTS = {
+    'hqgc':      dict(head='vqc', message_passing=True, angle_norm=True),
+    'classical': dict(head='classical', message_passing=True, angle_norm=True),  # VQC -> matched classical map
+    'novqc':     dict(head='none', message_passing=True, angle_norm=True),       # VQC removed
+    'dense':     dict(head='dense', message_passing=True, angle_norm=True),      # VQC -> dense layer tanh(Wx+b)
+    'nomp':      dict(head='vqc', message_passing=False, angle_norm=True),       # message passing removed
+    'nonorm':    dict(head='vqc', message_passing=True, angle_norm=False),       # input normalization removed
+}
 
 
 class TrainingConfig:
-    """Configuration for training"""
-    def __init__(self):
-        self.epochs = 100  # Increased to 100 epochs
-        self.lr = 0.001
-        self.batch_size = 64  # Increased batch size for faster training
-        self.q_depths = [1, 1]  # Quantum circuit depth for each layer
-        self.train_ratio = 0.8
-        self.val_ratio = 0.1
-        self.test_ratio = 0.1
-        self.val_frequency = 5  # Validate every N epochs to save time
-        self.log_frequency = 5  # Log to TensorBoard every N epochs
-        self.print_frequency = 10  # Print progress every N epochs
-        # Early stopping configuration
-        self.early_stop_patience = 10  # Number of validation checks to wait before stopping
-        self.early_stop_min_delta = 0.0001  # Minimum change to qualify as an improvement
-        self.early_stop_monitor = 'val_acc'  # Metric to monitor: 'val_acc' or 'val_loss'
-        self.early_stop_mode = 'max'  # 'max' for accuracy, 'min' for loss
+    """Configuration for training (defaults from data/config.json)"""
+    def __init__(self, path=os.path.join(code_dir, 'data', 'config.json')):
+        with open(path) as f:
+            c = json.load(f)
+        self.val_ratio = c['VAL RATIO']
+        self.batch_size = c['BATCH SIZE']
+        self.epochs = c['EPOCHS']
+        self.lr = c['LEARNING RATE']
+        self.n_qubits = c['N QUBITS']
+        self.q_depths = c['Q DEPTHS']
+        self.val_frequency = c['VAL FREQUENCY']              # validate every N epochs
+        self.early_stop_patience = c['EARLY STOP PATIENCE']  # number of validation checks without improvement
+        self.early_stop_min_delta = 1e-4
+        self.seeds = c['SEEDS']
 
 
-def train_model(model, train_loader, val_loader, config, device, writer=None, best_model_path=None):
-    """Train a model with optimizations and early stopping"""
-    optimizer = Adam(model.parameters(), lr=config.lr)
-    criterion = nn.BCEWithLogitsLoss()
-    
-    # Enable cuDNN benchmarking for faster operations (if CUDA available)
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-    
-    # Use mixed precision training if CUDA is available
-    use_amp = torch.cuda.is_available()
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
-    
-    # Early stopping variables
-    best_val_acc = 0.0
-    best_val_loss = float('inf')
-    patience_counter = 0
-    best_epoch = 1  # Initialize to 1 in case first epoch is best
-    validation_count = 0  # Track number of validation checks
-    
-    # Determine which metric to monitor
-    monitor_metric = config.early_stop_monitor
-    is_better = lambda current, best: (current > best + config.early_stop_min_delta) if config.early_stop_mode == 'max' else (current < best - config.early_stop_min_delta)
-    
-    for epoch in range(config.epochs):
-        # Training phase
-        model.train()
-        train_loss = 0
-        train_correct = 0
-        train_total = 0
-        train_preds = []
-        train_labels = []
-        
-        # Remove tqdm for faster iteration
-        for batch in train_loader:
-            batch = batch.to(device, non_blocking=True)
-            optimizer.zero_grad()
-            
-            # Use mixed precision if available
-            if use_amp:
-                with torch.amp.autocast('cuda'):
-                    out = model(batch.x, batch.edge_index, batch.batch)
-                    target = batch.y.float().unsqueeze(1)
-                    loss = criterion(out, target)
-                
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                out = model(batch.x, batch.edge_index, batch.batch)
-                target = batch.y.float().unsqueeze(1)
-                loss = criterion(out, target)
-                loss.backward()
-                optimizer.step()
-            
-            train_loss += loss.item()
-            pred = (torch.sigmoid(out) > 0.5).float()
-            train_correct += (pred == target).sum().item()
-            train_total += target.size(0)
-            
-            # Collect predictions and labels for metrics calculation
-            train_preds.extend(pred.cpu().numpy().flatten())
-            train_labels.extend(target.cpu().numpy().flatten())
-        
-        train_acc = train_correct / train_total if train_total > 0 else 0
-        avg_train_loss = train_loss / len(train_loader) if len(train_loader) > 0 else 0
-        
-        # Calculate precision, recall, and F1 for training
-        train_preds_array = np.array(train_preds)
-        train_labels_array = np.array(train_labels)
-        train_precision = precision_score(train_labels_array, train_preds_array, zero_division=0)
-        train_recall = recall_score(train_labels_array, train_preds_array, zero_division=0)
-        train_f1 = f1_score(train_labels_array, train_preds_array, zero_division=0)
-        
-        # Validation phase (only every N epochs to save time)
-        val_acc = 0.0
-        avg_val_loss = 0.0
-        val_precision = 0.0
-        val_recall = 0.0
-        val_f1 = 0.0
-        train_precision = 0.0
-        train_recall = 0.0
-        train_f1 = 0.0
-        should_validate = (epoch + 1) % config.val_frequency == 0 or epoch == config.epochs - 1
-        improved = False  # Track if model improved during validation
-        
-        if should_validate:
-            validation_count += 1
-            model.eval()
-            val_loss = 0
-            val_correct = 0
-            val_total = 0
-            val_preds = []
-            val_labels = []
-            
-            with torch.no_grad():
-                for batch in val_loader:
-                    batch = batch.to(device, non_blocking=True)
-                    
-                    if use_amp:
-                        with torch.amp.autocast('cuda'):
-                            out = model(batch.x, batch.edge_index, batch.batch)
-                            target = batch.y.float().unsqueeze(1)
-                            loss = criterion(out, target)
-                    else:
-                        out = model(batch.x, batch.edge_index, batch.batch)
-                        target = batch.y.float().unsqueeze(1)
-                        loss = criterion(out, target)
-                    
-                    val_loss += loss.item()
-                    pred = (torch.sigmoid(out) > 0.5).float()
-                    val_correct += (pred == target).sum().item()
-                    val_total += target.size(0)
-                    
-                    # Collect predictions and labels for metrics calculation
-                    val_preds.extend(pred.cpu().numpy().flatten())
-                    val_labels.extend(target.cpu().numpy().flatten())
-            
-            val_acc = val_correct / val_total if val_total > 0 else 0
-            avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
-            
-            # Calculate precision, recall, and F1
-            val_preds_array = np.array(val_preds)
-            val_labels_array = np.array(val_labels)
-            val_precision = precision_score(val_labels_array, val_preds_array, zero_division=0)
-            val_recall = recall_score(val_labels_array, val_preds_array, zero_division=0)
-            val_f1 = f1_score(val_labels_array, val_preds_array, zero_division=0)
-            
-            # Early stopping logic (only check when validation is performed)
-            current_metric = val_acc if monitor_metric == 'val_acc' else avg_val_loss
-            best_metric = best_val_acc if monitor_metric == 'val_acc' else best_val_loss
-            
-            improved = False
-            if monitor_metric == 'val_acc':
-                # For first validation, always save
-                if validation_count == 1:
-                    best_val_acc = val_acc
-                    improved = True
-                elif is_better(val_acc, best_val_acc):
-                    best_val_acc = val_acc
-                    improved = True
-            else:  # val_loss
-                # For first validation, always save
-                if validation_count == 1:
-                    best_val_loss = avg_val_loss
-                    improved = True
-                elif is_better(avg_val_loss, best_val_loss):
-                    best_val_loss = avg_val_loss
-                    improved = True
-            
-            if improved:
-                patience_counter = 0
-                best_epoch = epoch + 1
-                # Save best model weights
-                if best_model_path is not None:
-                    torch.save(model.state_dict(), best_model_path)
-                    if writer is not None:
-                        writer.add_scalar('EarlyStop/Best_Epoch', best_epoch, epoch + 1)
-            else:
-                patience_counter += 1
-            
-            # Check for early stopping
-            if patience_counter >= config.early_stop_patience:
-                print(f"\nEarly stopping triggered at epoch {epoch+1} (validation check {validation_count}). "
-                      f"Best {monitor_metric} was {best_metric:.4f} at epoch {best_epoch}.")
-                if writer is not None:
-                    writer.add_scalar('EarlyStop/Stopped_At', epoch + 1, epoch + 1)
-                break
-        
-        # Log to TensorBoard (only every N epochs to reduce I/O overhead)
-        if writer is not None and ((epoch + 1) % config.log_frequency == 0 or epoch == config.epochs - 1):
-            writer.add_scalar('Loss/Train', avg_train_loss, epoch + 1)
-            writer.add_scalar('Loss/Validation', avg_val_loss, epoch + 1)
-            writer.add_scalar('Accuracy/Train', train_acc, epoch + 1)
-            writer.add_scalar('Accuracy/Validation', val_acc, epoch + 1)
-            writer.add_scalar('Precision/Train', train_precision, epoch + 1)
-            writer.add_scalar('Recall/Train', train_recall, epoch + 1)
-            writer.add_scalar('F1/Train', train_f1, epoch + 1)
-            if should_validate:
-                writer.add_scalar('Precision/Validation', val_precision, epoch + 1)
-                writer.add_scalar('Recall/Validation', val_recall, epoch + 1)
-                writer.add_scalar('F1/Validation', val_f1, epoch + 1)
-        
-        # Print progress (only every N epochs to reduce I/O)
-        if (epoch + 1) % config.print_frequency == 0 or epoch == config.epochs - 1:
-            early_stop_info = f" [Early Stop: {patience_counter}/{config.early_stop_patience}]" if should_validate and patience_counter > 0 else ""
-            best_info = f" [Best: Epoch {best_epoch}]" if should_validate and improved else ""
-            if should_validate:
-                print(f"Epoch {epoch+1}/{config.epochs}: Train Loss: {avg_train_loss:.4f}, "
-                      f"Train Acc: {train_acc:.4f} (P:{train_precision:.4f}, R:{train_recall:.4f}, F1:{train_f1:.4f}), "
-                      f"Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.4f} "
-                      f"(P:{val_precision:.4f}, R:{val_recall:.4f}, F1:{val_f1:.4f}){early_stop_info}{best_info}")
-            else:
-                print(f"Epoch {epoch+1}/{config.epochs}: Train Loss: {avg_train_loss:.4f}, "
-                      f"Train Acc: {train_acc:.4f} (P:{train_precision:.4f}, R:{train_recall:.4f}, F1:{train_f1:.4f})")
-    
-    # Load best model weights before returning
-    if best_model_path is not None and os.path.exists(best_model_path):
-        print(f"Loading best model weights from epoch {best_epoch}...")
-        model.load_state_dict(torch.load(best_model_path, map_location=device))
-        if writer is not None:
-            writer.add_scalar('EarlyStop/Final_Best_Epoch', best_epoch, config.epochs)
-    
-    return model, best_epoch
+def model_device(model):
+    return next(model.parameters()).device
 
 
-def evaluate_model(model, test_loader, device):
-    """Evaluate model and return metrics"""
+def synchronize(device):
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+
+
+@torch.no_grad()
+def predict(model, loader):
     model.eval()
-    all_preds = []
-    all_labels = []
-    
-    use_amp = torch.cuda.is_available()
-    
-    with torch.no_grad():
-        for batch in test_loader:
-            batch = batch.to(device, non_blocking=True)
-            
-            if use_amp:
-                with torch.amp.autocast('cuda'):
-                    out = model(batch.x, batch.edge_index, batch.batch)
-            else:
-                out = model(batch.x, batch.edge_index, batch.batch)
-            
-            pred = (torch.sigmoid(out) > 0.5).float().cpu().numpy()
-            labels = batch.y.cpu().numpy()
-            
-            all_preds.extend(pred.flatten())
-            all_labels.extend(labels)
-    
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    
-    # Calculate metrics
-    accuracy = accuracy_score(all_labels, all_preds)
-    precision = precision_score(all_labels, all_preds, zero_division=0)
-    recall = recall_score(all_labels, all_preds, zero_division=0)
-    f1 = f1_score(all_labels, all_preds, zero_division=0)
-    
+    device = model_device(model)
+    preds, labels = [], []
+    for batch in loader:
+        batch = batch.to(device)
+        out = model(batch.x, batch.edge_index, batch.batch)
+        preds.append((torch.sigmoid(out) > 0.5).long().flatten().cpu())
+        labels.append(batch.y.flatten().cpu())
+    return torch.cat(labels).numpy(), torch.cat(preds).numpy()
+
+
+def evaluate_model(model, loader):
+    """Evaluate model and return metrics"""
+    y, p = predict(model, loader)
     return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1
+        'accuracy': accuracy_score(y, p),
+        'precision': precision_score(y, p, zero_division=0),
+        'recall': recall_score(y, p, zero_division=0),
+        'f1': f1_score(y, p, zero_division=0),
     }
 
 
-def get_input_dim(train_loader):
-    """Get input dimension from first batch"""
-    for batch in train_loader:
-        return batch.x.size(1)
-    return 64  # default
+def train_model(model, train_loader, val_loader, config):
+    """Train with early stopping on validation F1; returns the model with the best weights restored."""
+    optimizer = Adam(model.parameters(), lr=config.lr)
+    criterion = nn.BCEWithLogitsLoss()
+    device = model_device(model)
+
+    best_f1, best_state, best_epoch, bad_checks, epoch_times = -1.0, None, 0, 0, []
+    for epoch in range(config.epochs):
+        model.train()
+        t0 = time.perf_counter()
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            out = model(batch.x, batch.edge_index, batch.batch)
+            loss = criterion(out, batch.y.float().unsqueeze(1))
+            loss.backward()
+            optimizer.step()
+        synchronize(device)
+        epoch_times.append(time.perf_counter() - t0)
+
+        # Validation phase (only every N epochs)
+        if (epoch + 1) % config.val_frequency and epoch != config.epochs - 1:
+            continue
+        val_f1 = evaluate_model(model, val_loader)['f1']
+        if val_f1 > best_f1 + config.early_stop_min_delta:
+            best_f1, best_epoch, bad_checks = val_f1, epoch + 1, 0
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+        else:
+            bad_checks += 1
+            if bad_checks >= config.early_stop_patience:
+                print(f"  early stopping at epoch {epoch + 1}; best val F1 {best_f1:.4f} at epoch {best_epoch}")
+                break
+
+    model.load_state_dict(best_state)
+    return model, dict(best_epoch=best_epoch, epochs_run=epoch + 1, val_f1=best_f1,
+                       sec_per_epoch=float(np.mean(epoch_times)))
+
+
+@torch.no_grad()
+def measure_latency(model, dataset, warmup=20):
+    """Per-contract latency (ms) from a cached graph to the decision, batch size 1."""
+    model.eval()
+    device = model_device(model)
+    dataset = [d.to(device) for d in dataset]  # cached graphs already on the device
+    for d in dataset[:warmup]:
+        model(d.x, d.edge_index, torch.zeros(d.num_nodes, dtype=torch.long, device=device))
+    synchronize(device)
+    lat, circ = [], []
+    for d in dataset:
+        batch = torch.zeros(d.num_nodes, dtype=torch.long, device=device)
+        CIRCUIT_TIME[0] = 0.0
+        t0 = time.perf_counter()
+        decision = (torch.sigmoid(model(d.x, d.edge_index, batch)) > 0.5).item()
+        lat.append(time.perf_counter() - t0)
+        circ.append(CIRCUIT_TIME[0])
+    lat, circ = np.array(lat) * 1e3, np.array(circ) * 1e3
+    return dict(mean_ms=float(lat.mean()), std_ms=float(lat.std()), circuit_share=float(circ.sum() / lat.sum()))
+
+
+def run(vuln_type, seed, variant, args, config):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    train_loader, val_loader, test_loader = get_dataloaders(
+        os.path.join(args.data_dir, vuln_type, 'train.json'),
+        os.path.join(args.data_dir, vuln_type, 'valid.json'),
+        batch_size=config.batch_size, val_ratio=config.val_ratio, seed=seed)
+
+    model = QGCN(input_dims=train_loader.dataset[0].x.size(1), q_depths=config.q_depths, output_dims=1,
+                 n_qubits=config.n_qubits, activ_fn=LeakyReLU(0.2), **VARIANTS[variant])
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_circuit = sum(p.numel() for m in model.modules() if isinstance(m, TimedQuantumNet) for p in m.parameters())
+    model = model.to(args.device)
+
+    model, info = train_model(model, train_loader, val_loader, config)
+    result = dict(vulnerability=vuln_type, variant=variant, seed=seed, n_qubits=config.n_qubits,
+                  device=str(args.device), n_params=n_params,
+                  n_circuit_params=n_circuit, **info, **evaluate_model(model, test_loader))
+    if args.latency:
+        result.update(measure_latency(model, list(test_loader.dataset)))
+    if args.save_models:
+        torch.save(model.state_dict(), os.path.join(args.out_dir, f"{variant}_{vuln_type}_s{seed}.pth"))
+    return result
 
 
 def main():
-    # Configuration
     config = TrainingConfig()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    if torch.cuda.is_available():
-        print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA Version: {torch.version.cuda}")
-        print("Mixed precision training: ENABLED")
-        print("cuDNN benchmarking: ENABLED")
-    else:
-        print("Warning: CUDA is not available, training will be slower on CPU")
-    
-    # Paths to vulnerability data
-    base_data_path = "/home/HardDisk/CatKhanh/GNNSCVulDetector/train_data"
-    # Training order: reentrancy -> timestamp -> integeroverflow
-    vulnerability_types = ['reentrancy', 'timestamp', 'integeroverflow']
-    
-    # Model configurations to test (QGCN Linear only)
-    model_configs = [
-        {'name': 'QGCN_Linear', 'classifier': None},
-    ]
-    
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--data_dir', required=True, help='GNNSCVulDetector/train_data')
+    ap.add_argument('--vuln', nargs='+', default=['reentrancy', 'timestamp'])
+    ap.add_argument('--variant', nargs='+', default=['hqgc'], choices=list(VARIANTS))
+    ap.add_argument('--seeds', nargs='+', type=int, default=config.seeds)
+    ap.add_argument('--out_dir', default='results')
+    ap.add_argument('--n_qubits', type=int, default=config.n_qubits,
+                    help='embedding width n (number of qubits for the VQC variants)')
+    ap.add_argument('--threads', type=int, default=0, help='torch CPU threads (0 = library default)')
+    ap.add_argument('--device', default='cpu', help="'cpu' or 'cuda' (circuits are simulated on this device)")
+    ap.add_argument('--latency', action='store_true', help='also measure per-contract inference latency')
+    ap.add_argument('--save_models', action='store_true')
+    args = ap.parse_args()
+
+    config.n_qubits = args.n_qubits
+    if args.threads:
+        torch.set_num_threads(args.threads)
+    os.makedirs(args.out_dir, exist_ok=True)
+
     results = []
-    
-    # Train each model on each vulnerability type
-    for vuln_type in vulnerability_types:
-        print(f"\n{'='*60}")
-        print(f"Processing vulnerability type: {vuln_type}")
-        print(f"{'='*60}\n")
-        
-        train_path = os.path.join(base_data_path, vuln_type, 'train.json')
-        valid_path = os.path.join(base_data_path, vuln_type, 'valid.json')
-        
-        if not os.path.exists(train_path) or not os.path.exists(valid_path):
-            print(f"Warning: Data files not found for {vuln_type}, skipping...")
-            continue
-        
-        # Load data
-        print("Loading data...")
-        # Use entire train.json for training, valid.json for validation/testing
-        train_loader, val_loader, test_loader = get_dataloaders(
-            train_path, valid_path, test_path=None,
-            batch_size=config.batch_size,
-            train_ratio=config.train_ratio,  # Not used anymore
-            val_ratio=config.val_ratio,      # Not used anymore
-            test_ratio=config.test_ratio     # Not used anymore
-        )
-        
-        # Get input dimension
-        input_dims = get_input_dim(train_loader)
-        output_dims = 1  # Binary classification
-        
-        print(f"Input dimension: {input_dims}")
-        print(f"Training samples: {len(train_loader.dataset)} (entire train.json)")
-        print(f"Validation samples: {len(val_loader.dataset)} (valid.json)")
-        print(f"Test samples: {len(test_loader.dataset)} (valid.json)")
-        print(f"Batch size: {config.batch_size}")
-        print(f"Epochs: {config.epochs}")
-        print(f"Validation frequency: every {config.val_frequency} epochs")
-        print(f"Logging frequency: every {config.log_frequency} epochs")
-        
-        # Train each model configuration
-        for model_config in model_configs:
-            model_name = model_config['name']
-            classifier_type = model_config['classifier']
-            
-            print(f"\n{'-'*60}")
-            print(f"Training {model_name} on {vuln_type}")
-            print(f"{'-'*60}\n")
-            
-            # Setup TensorBoard writer
-            log_dir_base = "/home/HardDisk/CatKhanh/Quantum_GNN/runs_v2"
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_dir = os.path.join(log_dir_base, vuln_type, f"{model_name}_{timestamp}")
-            writer = SummaryWriter(log_dir=log_dir)
-            print(f"TensorBoard logs saved to: {log_dir}")
-            print(f"To view, run: tensorboard --logdir={log_dir_base}\n")
-            
-            try:
-                # Create model
-                model = QGCN(
-                    input_dims=input_dims,
-                    q_depths=config.q_depths,
-                    output_dims=output_dims,
-                    activ_fn=LeakyReLU(0.2),
-                    classifier=classifier_type,
-                    readout=False
-                ).to(device)
-                
-                # Note: Model compilation disabled for quantum models due to complex number operations
-                # torch.compile() has limited support for complex operators used in quantum circuits
-                # The warnings about "complex operators" and "cudagraphs" are expected and can be ignored
-                # Training will continue normally without compilation
-                
-                # Create temporary path for best model weights during training
-                models_dir = "/home/HardDisk/CatKhanh/Quantum_GNN/models"
-                os.makedirs(models_dir, exist_ok=True)
-                best_model_temp_path = os.path.join(models_dir, f"best_{model_name}_{vuln_type}_{timestamp}.pth")
-                
-                # Train model with early stopping
-                print(f"Early stopping: patience={config.early_stop_patience} validation checks, "
-                      f"monitor={config.early_stop_monitor}, mode={config.early_stop_mode}\n")
-                model, best_epoch = train_model(model, train_loader, val_loader, config, device, 
-                                  writer=writer, best_model_path=best_model_temp_path)
-                
-                # Evaluate model
-                print("\nEvaluating on test set...")
-                metrics = evaluate_model(model, test_loader, device)
-                
-                # Log final test metrics to TensorBoard
-                writer.add_scalar('Metrics/Test_Accuracy', metrics['accuracy'], config.epochs)
-                writer.add_scalar('Metrics/Test_Precision', metrics['precision'], config.epochs)
-                writer.add_scalar('Metrics/Test_Recall', metrics['recall'], config.epochs)
-                writer.add_scalar('Metrics/Test_F1', metrics['f1'], config.epochs)
-                
-                # Store results
-                results.append({
-                    'Vulnerability_Type': vuln_type,
-                    'Model': model_name,
-                    'Accuracy': metrics['accuracy'],
-                    'Precision': metrics['precision'],
-                    'Recall': metrics['recall'],
-                    'F1': metrics['f1']
-                })
-                
-                print(f"\nResults for {model_name} on {vuln_type}:")
-                print(f"  Accuracy:  {metrics['accuracy']:.4f}")
-                print(f"  Precision: {metrics['precision']:.4f}")
-                print(f"  Recall:    {metrics['recall']:.4f}")
-                print(f"  F1:        {metrics['f1']:.4f}\n")
-                
-                # Save final model weights (best model from early stopping)
-                model_filename = f"{model_name}_{vuln_type}_{timestamp}.pth"
-                model_path = os.path.join(models_dir, model_filename)
-                torch.save({
-                    'model_state_dict': model.state_dict(),
-                    'input_dims': input_dims,
-                    'output_dims': output_dims,
-                    'q_depths': config.q_depths,
-                    'classifier': classifier_type,
-                    'vulnerability_type': vuln_type,
-                    'model_name': model_name,
-                    'metrics': metrics,
-                    'epochs': config.epochs,
-                    'early_stopped': True,
-                    'best_epoch': best_epoch
-                }, model_path)
-                print(f"Model weights saved to: {model_path}\n")
-                
-                # Clean up temporary best model file
-                if os.path.exists(best_model_temp_path):
-                    os.remove(best_model_temp_path)
-                
-                # Close writer
-                writer.close()
-                
-            except Exception as e:
-                print(f"Error training {model_name} on {vuln_type}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                results.append({
-                    'Vulnerability_Type': vuln_type,
-                    'Model': model_name,
-                    'Accuracy': np.nan,
-                    'Precision': np.nan,
-                    'Recall': np.nan,
-                    'F1': np.nan
-                })
-                # Close writer even on error
-                if 'writer' in locals():
-                    writer.close()
-    
-    # Create results DataFrame and save
-    results_df = pd.DataFrame(results)
-    
-    # Save to CSV
-    output_path = "/home/HardDisk/CatKhanh/Quantum_GNN/results_table_fast.csv"
-    results_df.to_csv(output_path, index=False)
-    
-    print(f"\n{'='*60}")
-    print("Training Complete!")
-    print(f"{'='*60}\n")
-    print("Results Summary:")
-    print(results_df.to_string(index=False))
-    print(f"\nResults saved to: {output_path}")
-    print(f"\nModel weights saved to: /home/HardDisk/CatKhanh/Quantum_GNN/models")
-    print(f"TensorBoard logs saved to: /home/HardDisk/CatKhanh/Quantum_GNN/runs_v2")
-    print(f"To view TensorBoard, run: tensorboard --logdir=/home/HardDisk/CatKhanh/Quantum_GNN/runs_v2")
+    for vuln_type in args.vuln:
+        for variant in args.variant:
+            for seed in args.seeds:
+                print(f"{vuln_type} / {variant} / seed {seed}")
+                r = run(vuln_type, seed, variant, args, config)
+                print(f"  test acc {r['accuracy']:.4f}  pre {r['precision']:.4f}  "
+                      f"rec {r['recall']:.4f}  f1 {r['f1']:.4f}  ({r['n_params']} params)")
+                tag = variant if args.n_qubits == 8 else f"{variant}_n{args.n_qubits}"
+                with open(os.path.join(args.out_dir, f"{tag}_{vuln_type}_s{seed}.json"), 'w') as f:
+                    json.dump(r, f, indent=1)
+                results.append(r)
+
+    df = pd.DataFrame(results)
+    df.to_csv(os.path.join(args.out_dir, 'results_per_seed.csv'), index=False)
+
+    # mean +- sample standard deviation over seeds, in %
+    metrics = ['accuracy', 'precision', 'recall', 'f1']
+    summary = df.groupby(['vulnerability', 'variant', 'n_qubits']).agg(
+        n_params=('n_params', 'first'), seeds=('seed', 'count'),
+        **{f"{m}_mean": (m, 'mean') for m in metrics}, **{f"{m}_std": (m, 'std') for m in metrics}).reset_index()
+    for m in metrics:
+        summary[f"{m}_mean"] *= 100
+        summary[f"{m}_std"] = summary[f"{m}_std"].fillna(0.0) * 100
+    summary.to_csv(os.path.join(args.out_dir, 'results_summary.csv'), index=False)
+
+    print("\nSummary (%, mean ± std over seeds):")
+    for _, s in summary.iterrows():
+        cells = "  ".join(f"{m[:3]} {s[m + '_mean']:.1f}±{s[m + '_std']:.1f}" for m in metrics)
+        print(f"  {s['vulnerability']:<11s} {s['variant']:<10s} {int(s['n_params']):>5d} params  {cells}")
 
 
 if __name__ == "__main__":
     main()
-

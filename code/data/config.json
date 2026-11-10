@@ -1,6 +1,12 @@
 {
-  "TRAIN": 0.8,
-  "VAL": 0.1,
-  "TEST": 0.1,
-  "BATCH SIZE": 64
+  "VAL RATIO": 0.1,
+  "BATCH SIZE": 64,
+  "EPOCHS": 100,
+  "LEARNING RATE": 0.001,
+  "N QUBITS": 8,
+  "Q DEPTHS": [1, 1],
+  "VAL FREQUENCY": 5,
+  "EARLY STOP PATIENCE": 10,
+  "EARLY STOP MONITOR": "val_f1",
+  "SEEDS": [0, 1, 2, 3, 4]
 }

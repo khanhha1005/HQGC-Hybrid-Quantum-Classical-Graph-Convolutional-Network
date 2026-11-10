@@ -216,3 +216,6 @@ __marimo__/
 dataset_preprocessing_for_vulnerabilities/
 __MACOSX/
 Ethereum_smart_contract_datast/
+
+# Training outputs
+results/
